@@ -1,0 +1,19 @@
+services:
+  openvpn:
+    image: kylemanna/openvpn:2.6
+    container_name: openvpn
+    restart: unless-stopped
+
+    network_mode: "host"
+
+    cap_add:
+      - NET_ADMIN
+
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    volumes:
+      - ./openvpn-data:/etc/openvpn
+
+    sysctls:
+      - net.ipv4.ip_forward=1
