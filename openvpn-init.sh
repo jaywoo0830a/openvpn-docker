@@ -77,18 +77,40 @@ wait_for_container() {
   return 1
 }
 
+wait_for_sagent_socket() {
+  # Wait until Access Server agent socket becomes available
+  local tries=120
+  while (( tries > 0 )); do
+    # Check for either socket path that sacli mentions
+    if docker exec -i openvpn-as /bin/bash -lc \
+      'test -S /usr/local/openvpn_as/etc/sock/sagent.localroot -o -S /usr/local/openvpn_as/etc/sock/sagent' \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    tries=$((tries - 1))
+  done
+  return 1
+}
+
 set_admin_password_if_requested() {
   if [[ -z "${ADMIN_PASSWORD}" ]]; then
     return 0
   fi
 
-  # The image docs show using sacli in container to set password:
-  # sacli --user "openvpn" --new_pass "WhateverPasswordYouWant" SetLocalPassword
-  # :contentReference[oaicite:5]{index=5}
+  echo "[init] Waiting for Access Server agent socket..."
+  if ! wait_for_sagent_socket; then
+    echo "ERROR: Access Server agent socket not ready. Check logs:"
+    echo "  sudo docker logs -n 200 openvpn-as"
+    exit 1
+  fi
 
   echo "[init] Setting admin password via sacli (user: openvpn)"
   docker exec -i openvpn-as /bin/bash -lc \
-    "sacli --user \"openvpn\" --new_pass \"${ADMIN_PASSWORD}\" SetLocalPassword" >/dev/null
+    "sacli --user \"openvpn\" --new_pass \"${ADMIN_PASSWORD}\" SetLocalPassword"
+
+  # Official docs show running sacli start afterwards
+  docker exec -i openvpn-as /bin/bash -lc "sacli start" >/dev/null
 }
 
 main() {
