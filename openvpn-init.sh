@@ -93,13 +93,11 @@ wait_for_container_running() {
   return 1
 }
 
-wait_for_sagent_socket() {
-  # sacli talks to sagent sockets; these appear after the service boots.
+wait_for_sacli_ready() {
+  # Wait until sacli can talk to the agent (socket path can vary by image/version)
   local tries=180
   while (( tries > 0 )); do
-    if docker exec -i openvpn-as /bin/bash -lc \
-      'test -S /usr/local/openvpn_as/etc/sock/sagent.localroot -o -S /usr/local/openvpn_as/etc/sock/sagent' \
-      >/dev/null 2>&1; then
+    if docker exec -i openvpn-as /bin/bash -lc 'sacli status >/dev/null 2>&1'; then
       return 0
     fi
     sleep 1
@@ -113,9 +111,9 @@ set_admin_password_if_requested() {
     return 0
   fi
 
-  echo "[init] Waiting for Access Server agent socket to be ready..."
-  if ! wait_for_sagent_socket; then
-    echo "ERROR: Access Server agent socket not ready yet."
+  echo "[init] Waiting for sacli to be ready..."
+  if ! wait_for_sacli_ready; then
+    echo "ERROR: sacli not ready yet."
     echo "Check logs:"
     echo "  sudo docker logs -n 200 openvpn-as"
     exit 1
