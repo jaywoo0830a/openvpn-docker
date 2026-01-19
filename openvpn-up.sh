@@ -3,16 +3,14 @@ set -euo pipefail
 
 COMPOSE_FILE="${COMPOSE_FILE:-./compose.yaml}"
 
-AS_ADMIN_PORT="${AS_ADMIN_PORT:-943}"
 AS_TCP_PORT="${AS_TCP_PORT:-443}"
 AS_UDP_PORT="${AS_UDP_PORT:-1194}"
 
-ADMIN_ALLOW_CIDR="${ADMIN_ALLOW_CIDR:-}"
+ENABLE_TCP_443="${ENABLE_TCP_443:-0}"
 
 RULE_TAG_PREFIX="managed-by=openvpn-as"
-RULE_TAG_UDP="${RULE_TAG_PREFIX};port=udp:${AS_UDP_PORT}"
-RULE_TAG_TCP443="${RULE_TAG_PREFIX};port=tcp:${AS_TCP_PORT}"
-RULE_TAG_ADMIN="${RULE_TAG_PREFIX};port=tcp:${AS_ADMIN_PORT}"
+RULE_TAG_UDP="${RULE_TAG_PREFIX};udp:${AS_UDP_PORT}"
+RULE_TAG_TCP="${RULE_TAG_PREFIX};tcp:${AS_TCP_PORT}"
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -38,21 +36,12 @@ apply_host_fw_rules() {
   ensure_host_fw_exists
 
   if ! rule_exists_by_comment "${RULE_TAG_UDP}"; then
-    nft add rule inet host_fw input udp dport "${AS_UDP_PORT}" ct state new accept comment "${RULE_TAG_UDP}"
+    nft add rule inet host_fw input udp dport "${AS_UDP_PORT}" ct state new accept comment "\"${RULE_TAG_UDP}\""
   fi
 
-  if ! rule_exists_by_comment "${RULE_TAG_TCP443}"; then
-    nft add rule inet host_fw input tcp dport "${AS_TCP_PORT}" ct state new accept comment "${RULE_TAG_TCP443}"
-  fi
-
-  if [[ -n "${ADMIN_ALLOW_CIDR}" ]]; then
-    if ! rule_exists_by_comment "${RULE_TAG_ADMIN};src=${ADMIN_ALLOW_CIDR}"; then
-      nft add rule inet host_fw input ip saddr "${ADMIN_ALLOW_CIDR}" tcp dport "${AS_ADMIN_PORT}" ct state new accept \
-        comment "${RULE_TAG_ADMIN};src=${ADMIN_ALLOW_CIDR}"
-    fi
-  else
-    if ! rule_exists_by_comment "${RULE_TAG_ADMIN}"; then
-      nft add rule inet host_fw input tcp dport "${AS_ADMIN_PORT}" ct state new accept comment "${RULE_TAG_ADMIN}"
+  if [[ "${ENABLE_TCP_443}" == "1" ]]; then
+    if ! rule_exists_by_comment "${RULE_TAG_TCP}"; then
+      nft add rule inet host_fw input tcp dport "${AS_TCP_PORT}" ct state new accept comment "\"${RULE_TAG_TCP}\""
     fi
   fi
 }
@@ -63,7 +52,7 @@ main() {
   docker compose version >/dev/null 2>&1 || { echo "ERROR: docker compose plugin not available."; exit 1; }
   have_cmd nft || { echo "ERROR: nft not found. Install: sudo apt-get install -y nftables"; exit 1; }
 
-  echo "[up] Applying host_fw rules"
+  echo "[up] Applying host_fw rules (hardened)"
   apply_host_fw_rules
 
   echo "[up] Starting container"
