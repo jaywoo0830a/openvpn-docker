@@ -19,7 +19,7 @@ main() {
   need_root
   have_cmd docker || { echo "ERROR: docker not found."; exit 1; }
   docker compose version >/dev/null 2>&1 || { echo "ERROR: docker compose plugin not available."; exit 1; }
-  have_cmd nft || { echo "ERROR: nft not found."; exit 1; }
+  have_cmd nft || { echo "ERROR: nft not found. Install: sudo apt-get install -y nftables"; exit 1; }
 
   echo "[down] Stopping container"
   compose down

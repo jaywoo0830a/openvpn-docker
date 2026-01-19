@@ -7,15 +7,15 @@ set -euo pipefail
 COMPOSE_FILE="${COMPOSE_FILE:-./compose.yaml}"
 DATA_DIR="${DATA_DIR:-./openvpn-as-data}"
 
-# Ports (as per image docs)
+# Ports (documented defaults for this image)
 AS_ADMIN_PORT="${AS_ADMIN_PORT:-943}"
 AS_TCP_PORT="${AS_TCP_PORT:-443}"
 AS_UDP_PORT="${AS_UDP_PORT:-1194}"
 
-# nftables dedicated table name
+# nftables dedicated table name (we only manage this table)
 NFT_TABLE="${NFT_TABLE:-openvpn_as_filter}"
 
-# Optional: restrict Admin UI to a single IP/CIDR (recommended)
+# Optional: restrict Admin UI (943) to a single public IP/CIDR (recommended)
 # Example: ADMIN_ALLOW_CIDR="203.0.113.10/32"
 ADMIN_ALLOW_CIDR="${ADMIN_ALLOW_CIDR:-}"
 
@@ -42,12 +42,29 @@ ensure_prereqs() {
   have_cmd nft || { echo "ERROR: nft not found. Install: sudo apt-get install -y nftables"; exit 1; }
 }
 
+warn_admin_allow_cidr() {
+  if [[ -z "${ADMIN_ALLOW_CIDR}" ]]; then
+    echo "[init] ADMIN_ALLOW_CIDR not set: Admin UI (943) will be reachable from anywhere."
+    echo "       Recommended: set ADMIN_ALLOW_CIDR to YOUR public IP (e.g. x.x.x.x/32)."
+    return 0
+  fi
+
+  # Very lightweight validation (CIDR contains /)
+  if [[ "${ADMIN_ALLOW_CIDR}" != */* ]]; then
+    echo "ERROR: ADMIN_ALLOW_CIDR must be in CIDR form, e.g. 203.0.113.10/32"
+    exit 1
+  fi
+
+  echo "[init] Admin UI (943) will be allowed only from: ${ADMIN_ALLOW_CIDR}"
+  echo "       Note: This should be your CLIENT public IP, not the server IP."
+}
+
 apply_nft_rules() {
   # We only manage our own dedicated table. We do NOT flush the whole ruleset.
   nft "add table inet ${NFT_TABLE}" 2>/dev/null || true
   nft "flush table inet ${NFT_TABLE}"
 
-  # Hook to input only; we keep policy accept to avoid breaking existing firewalls.
+  # Hook to input only; policy accept so we don't break existing firewall setups.
   nft "add chain inet ${NFT_TABLE} input { type filter hook input priority 0; policy accept; }"
 
   # Allow VPN ports
@@ -64,8 +81,7 @@ apply_nft_rules() {
   systemctl enable --now nftables >/dev/null 2>&1 || true
 }
 
-wait_for_container() {
-  # Wait until container reports healthy-ish by being "running"
+wait_for_container_running() {
   local tries=60
   while (( tries > 0 )); do
     if docker ps --format '{{.Names}}' | grep -qx 'openvpn-as'; then
@@ -78,10 +94,9 @@ wait_for_container() {
 }
 
 wait_for_sagent_socket() {
-  # Wait until Access Server agent socket becomes available
-  local tries=120
+  # sacli talks to sagent sockets; these appear after the service boots.
+  local tries=180
   while (( tries > 0 )); do
-    # Check for either socket path that sacli mentions
     if docker exec -i openvpn-as /bin/bash -lc \
       'test -S /usr/local/openvpn_as/etc/sock/sagent.localroot -o -S /usr/local/openvpn_as/etc/sock/sagent' \
       >/dev/null 2>&1; then
@@ -98,19 +113,22 @@ set_admin_password_if_requested() {
     return 0
   fi
 
-  echo "[init] Waiting for Access Server agent socket..."
+  echo "[init] Waiting for Access Server agent socket to be ready..."
   if ! wait_for_sagent_socket; then
-    echo "ERROR: Access Server agent socket not ready. Check logs:"
+    echo "ERROR: Access Server agent socket not ready yet."
+    echo "Check logs:"
     echo "  sudo docker logs -n 200 openvpn-as"
     exit 1
   fi
 
   echo "[init] Setting admin password via sacli (user: openvpn)"
   docker exec -i openvpn-as /bin/bash -lc \
-    "sacli --user \"openvpn\" --new_pass \"${ADMIN_PASSWORD}\" SetLocalPassword"
+    "sacli --user \"openvpn\" --new_pass \"${ADMIN_PASSWORD}\" SetLocalPassword" >/dev/null
 
-  # Official docs show running sacli start afterwards
+  # Ensure service is started/reloaded after password change
   docker exec -i openvpn-as /bin/bash -lc "sacli start" >/dev/null
+
+  echo "[init] Admin password set."
 }
 
 main() {
@@ -119,13 +137,15 @@ main() {
 
   mkdir -p "${DATA_DIR}"
 
+  warn_admin_allow_cidr
+
   echo "[init] Applying nftables rules (table: inet ${NFT_TABLE})"
   apply_nft_rules
 
   echo "[init] Starting OpenVPN Access Server"
   compose up -d
 
-  if ! wait_for_container; then
+  if ! wait_for_container_running; then
     echo "ERROR: Container did not start in time. Check logs:"
     echo "  sudo docker logs -n 200 openvpn-as"
     exit 1
@@ -135,16 +155,15 @@ main() {
 
   echo
   echo "OK."
-  echo "Admin UI: https://<SERVER_IP>:${AS_ADMIN_PORT}/admin"
-  echo "Client UI: https://<SERVER_IP>:${AS_ADMIN_PORT}/"
+  echo "Admin UI:   https://<SERVER_IP>:${AS_ADMIN_PORT}/admin"
+  echo "Client UI:  https://<SERVER_IP>:${AS_ADMIN_PORT}/"
   echo
   echo "Default admin user: openvpn"
-  echo "Initial password (if not set by ADMIN_PASSWORD) is shown in logs on first run:"
+  echo "If you didn't set ADMIN_PASSWORD, initial password is shown in logs on first run:"
   echo "  sudo docker logs -f openvpn-as"
   echo
-  echo "Important: In Admin UI, go to Configuration -> Network Settings and set"
-  echo "\"Hostname or IP Address\" to your public IP/domain for client connectivity."
-  echo "(This is explicitly mentioned in the image docs.)"
+  echo "After login: set the public hostname/IP in Admin UI:"
+  echo "  Configuration -> Network Settings -> Hostname or IP Address"
 }
 
 main "$@"
