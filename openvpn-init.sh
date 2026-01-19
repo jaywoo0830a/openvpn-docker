@@ -47,7 +47,6 @@ enable_ip_forward() {
 # Managed by openvpn-init.sh
 net.ipv4.ip_forward=1
 EOF
-  sysctl --system >/dev/null
 }
 
 ensure_dirs() {

@@ -1,6 +1,6 @@
 services:
   openvpn:
-    image: kylemanna/openvpn:2.6
+    image: kylemanna/openvpn:latest
     container_name: openvpn
     restart: unless-stopped
 
