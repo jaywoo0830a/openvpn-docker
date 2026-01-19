@@ -7,21 +7,27 @@ set -euo pipefail
 COMPOSE_FILE="${COMPOSE_FILE:-./compose.yaml}"
 DATA_DIR="${DATA_DIR:-./openvpn-as-data}"
 
-# Ports (documented defaults for this image)
 AS_ADMIN_PORT="${AS_ADMIN_PORT:-943}"
 AS_TCP_PORT="${AS_TCP_PORT:-443}"
 AS_UDP_PORT="${AS_UDP_PORT:-1194}"
-
-# nftables dedicated table name (we only manage this table)
-NFT_TABLE="${NFT_TABLE:-openvpn_as_filter}"
 
 # Optional: restrict Admin UI (943) to a single public IP/CIDR (recommended)
 # Example: ADMIN_ALLOW_CIDR="203.0.113.10/32"
 ADMIN_ALLOW_CIDR="${ADMIN_ALLOW_CIDR:-}"
 
 # Optional: set admin password automatically after first boot
-# Example: ADMIN_PASSWORD="StrongPasswordHere"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+
+# We will manage rules in inet host_fw input chain only.
+NFT_HOST_TABLE="inet"
+NFT_HOST_FW_TABLE="host_fw"
+NFT_HOST_CHAIN="input"
+
+# Tag our rules so we can delete them safely later.
+RULE_TAG_PREFIX="managed-by=openvpn-as"
+RULE_TAG_UDP="${RULE_TAG_PREFIX};port=udp:${AS_UDP_PORT}"
+RULE_TAG_TCP443="${RULE_TAG_PREFIX};port=tcp:${AS_TCP_PORT}"
+RULE_TAG_ADMIN="${RULE_TAG_PREFIX};port=tcp:${AS_ADMIN_PORT}"
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -32,24 +38,22 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-compose() {
-  docker compose -f "${COMPOSE_FILE}" "$@"
-}
+compose() { docker compose -f "${COMPOSE_FILE}" "$@"; }
 
 ensure_prereqs() {
   have_cmd docker || { echo "ERROR: docker not found."; exit 1; }
   docker compose version >/dev/null 2>&1 || { echo "ERROR: docker compose plugin not available."; exit 1; }
   have_cmd nft || { echo "ERROR: nft not found. Install: sudo apt-get install -y nftables"; exit 1; }
+  have_cmd systemctl || true
 }
 
 warn_admin_allow_cidr() {
   if [[ -z "${ADMIN_ALLOW_CIDR}" ]]; then
-    echo "[init] ADMIN_ALLOW_CIDR not set: Admin UI (943) will be reachable from anywhere."
-    echo "       Recommended: set ADMIN_ALLOW_CIDR to YOUR public IP (e.g. x.x.x.x/32)."
+    echo "[init] ADMIN_ALLOW_CIDR not set: Admin UI (943) will be reachable from anywhere (if allowed in host_fw)."
+    echo "       Recommended: set ADMIN_ALLOW_CIDR to YOUR client public IP (e.g. x.x.x.x/32)."
     return 0
   fi
 
-  # Very lightweight validation (CIDR contains /)
   if [[ "${ADMIN_ALLOW_CIDR}" != */* ]]; then
     echo "ERROR: ADMIN_ALLOW_CIDR must be in CIDR form, e.g. 203.0.113.10/32"
     exit 1
@@ -59,23 +63,51 @@ warn_admin_allow_cidr() {
   echo "       Note: This should be your CLIENT public IP, not the server IP."
 }
 
-apply_nft_rules() {
-  # We only manage our own dedicated table. We do NOT flush the whole ruleset.
-  nft "add table inet ${NFT_TABLE}" 2>/dev/null || true
-  nft "flush table inet ${NFT_TABLE}"
+ensure_host_fw_exists() {
+  # Ensure the table/chain exist. If user has different firewall design, fail loudly.
+  if ! nft list table inet host_fw >/dev/null 2>&1; then
+    echo "ERROR: nft table 'inet host_fw' not found."
+    echo "       Your firewall uses a different structure; adjust scripts accordingly."
+    exit 1
+  fi
 
-  # Hook to input only; policy accept so we don't break existing firewall setups.
-  nft "add chain inet ${NFT_TABLE} input { type filter hook input priority 0; policy accept; }"
+  if ! nft list chain inet host_fw input >/dev/null 2>&1; then
+    echo "ERROR: nft chain 'inet host_fw input' not found."
+    exit 1
+  fi
+}
 
-  # Allow VPN ports
-  nft "add rule inet ${NFT_TABLE} input udp dport ${AS_UDP_PORT} accept"
-  nft "add rule inet ${NFT_TABLE} input tcp dport ${AS_TCP_PORT} accept"
+rule_exists_by_comment() {
+  # Check if a rule with given comment exists in host_fw input
+  local comment="$1"
+  nft -a list chain inet host_fw input | grep -F "comment \"${comment}\"" >/dev/null 2>&1
+}
 
-  # Admin UI: allow either from anywhere, or restrict to ADMIN_ALLOW_CIDR
+add_host_fw_rules() {
+  ensure_host_fw_exists
+
+  echo "[init] Adding rules to inet host_fw input (these are the rules that actually matter with policy drop)."
+
+  # UDP 1194
+  if ! rule_exists_by_comment "${RULE_TAG_UDP}"; then
+    nft add rule inet host_fw input udp dport "${AS_UDP_PORT}" ct state new accept comment "${RULE_TAG_UDP}"
+  fi
+
+  # TCP 443 (optional but recommended for environments blocking UDP)
+  if ! rule_exists_by_comment "${RULE_TAG_TCP443}"; then
+    nft add rule inet host_fw input tcp dport "${AS_TCP_PORT}" ct state new accept comment "${RULE_TAG_TCP443}"
+  fi
+
+  # Admin UI 943 (either restricted or open)
   if [[ -n "${ADMIN_ALLOW_CIDR}" ]]; then
-    nft "add rule inet ${NFT_TABLE} input ip saddr ${ADMIN_ALLOW_CIDR} tcp dport ${AS_ADMIN_PORT} accept"
+    if ! rule_exists_by_comment "${RULE_TAG_ADMIN};src=${ADMIN_ALLOW_CIDR}"; then
+      nft add rule inet host_fw input ip saddr "${ADMIN_ALLOW_CIDR}" tcp dport "${AS_ADMIN_PORT}" ct state new accept \
+        comment "${RULE_TAG_ADMIN};src=${ADMIN_ALLOW_CIDR}"
+    fi
   else
-    nft "add rule inet ${NFT_TABLE} input tcp dport ${AS_ADMIN_PORT} accept"
+    if ! rule_exists_by_comment "${RULE_TAG_ADMIN}"; then
+      nft add rule inet host_fw input tcp dport "${AS_ADMIN_PORT}" ct state new accept comment "${RULE_TAG_ADMIN}"
+    fi
   fi
 
   systemctl enable --now nftables >/dev/null 2>&1 || true
@@ -94,7 +126,6 @@ wait_for_container_running() {
 }
 
 wait_for_sacli_ready() {
-  # Wait until sacli can talk to the agent (socket path can vary by image/version)
   local tries=180
   while (( tries > 0 )); do
     if docker exec -i openvpn-as /bin/bash -lc 'sacli status >/dev/null 2>&1'; then
@@ -123,7 +154,6 @@ set_admin_password_if_requested() {
   docker exec -i openvpn-as /bin/bash -lc \
     "sacli --user \"openvpn\" --new_pass \"${ADMIN_PASSWORD}\" SetLocalPassword" >/dev/null
 
-  # Ensure service is started/reloaded after password change
   docker exec -i openvpn-as /bin/bash -lc "sacli start" >/dev/null
 
   echo "[init] Admin password set."
@@ -137,8 +167,7 @@ main() {
 
   warn_admin_allow_cidr
 
-  echo "[init] Applying nftables rules (table: inet ${NFT_TABLE})"
-  apply_nft_rules
+  add_host_fw_rules
 
   echo "[init] Starting OpenVPN Access Server"
   compose up -d
@@ -160,8 +189,8 @@ main() {
   echo "If you didn't set ADMIN_PASSWORD, initial password is shown in logs on first run:"
   echo "  sudo docker logs -f openvpn-as"
   echo
-  echo "After login: set the public hostname/IP in Admin UI:"
-  echo "  Configuration -> Network Settings -> Hostname or IP Address"
+  echo "Recommended: keep Admin UI closed externally and use SSH port forwarding:"
+  echo "  ssh -fN -o ExitOnForwardFailure=yes -L 1943:127.0.0.1:${AS_ADMIN_PORT} ubuntu@<SERVER_IP>"
 }
 
 main "$@"
